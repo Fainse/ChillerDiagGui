@@ -59,6 +59,7 @@ pip install -r requirements.txt
 
 # Run
 python smc_diag_gui.py
+```
 
 Future Roadmap
 
