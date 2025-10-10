@@ -5,7 +5,7 @@ The app allows users to monitor, log, and control diagnostic parameters such as 
 
 ---
 
-## 🔧 Features
+## Features
 
 - **Real-time polling** of chiller diagnostic registers  
 - **Dynamic graphs** with multiple selectable data fields  
@@ -18,7 +18,7 @@ The app allows users to monitor, log, and control diagnostic parameters such as 
 
 ---
 
-## 🧠 How It Works
+## How It Works
 
 The application communicates with an SMC chiller using the **Modbus ASCII** protocol (7E1, 9600/19200 bps).  
 When connected to a serial port:
@@ -31,7 +31,7 @@ When connected to a serial port:
 
 ---
 
-## 🧰 Technologies Used
+## Technologies Used
 
 - **Python 3.8+** (Windows 7 compatible)
 - **PyQt5** — GUI framework  
@@ -42,7 +42,7 @@ When connected to a serial port:
 
 ---
 
-## 🖥️ Running the Application
+## Running the Application
 
 ### Option 1 — Run from Source
 ```bash
@@ -60,6 +60,18 @@ pip install -r requirements.txt
 # Run
 python smc_diag_gui.py
 ```
+Demo Mode (No Hardware Needed)
+
+To test the UI and plotting logic without connecting a real chiller:
+
+Open the script smc_diag_gui.py.
+
+Set the following line near the top:
+
+DEMO_MODE = True
+
+
+Launch the app — the demo will simulate live register data for temperature, pressure, alarms, and setpoint.
 
 Future Roadmap
 
