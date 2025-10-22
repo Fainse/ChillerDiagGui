@@ -5,7 +5,7 @@ block_cipher = None
 
 
 a = Analysis(
-    ['smc_diag_gui.py'],
+    ['ChillerDiagGui.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -46,5 +46,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='smc_diag_gui',
+    name='ChillerDiagGuiui',
 )

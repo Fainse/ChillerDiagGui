@@ -31,7 +31,7 @@ STATUS_ADDR = 0x0004     # bit0 = Run
 # Setpoint register (R/W)
 SETPOINT_ADDR = 0x000B   # "Fluid Set Temp"
 
-DEMO_MODE = True  # True = simulate without hardware; False = real serial
+DEMO_MODE = False  # True = simulate without hardware; False = real serial
 
 # -------------------- Modbus ASCII helpers --------------------
 def lrc(bs: bytes) -> int:
@@ -157,17 +157,22 @@ class SerialWorker(QtCore.QThread):
         except Exception:
             return False
 
-    def open(self, port: str, baud: int):
+    def open(self, port: str, baud: int, bytesize, parity, stopbits):
         try:
             self.ser = serial.Serial(
-                port=port, baudrate=baud, bytesize=BYTESIZE,
-                parity=PARITY, stopbits=STOPBITS,
+                port=port, baudrate=baud,
+                bytesize=bytesize, parity=parity, stopbits=stopbits,
                 timeout=READ_TIMEOUT, write_timeout=WRITE_TIMEOUT
             )
             self._run = True
             if not self.isRunning():
                 self.start()
-            self.status.emit(f"Opened {port} @ {baud} (7E1)")
+            # Show framing (e.g., 7E1, 8N1) in the status message
+            p = {serial.PARITY_NONE: "N", serial.PARITY_EVEN: "E", serial.PARITY_ODD: "O"}.get(parity, "?")
+            db = 7 if bytesize == serial.SEVENBITS else 8
+            sb = 1 if stopbits == serial.STOPBITS_ONE else 2
+            self.status.emit(f"Opened {port} @ {baud} ({db}{p}{sb})")
+
         except Exception as e:
             self.ser = None
             self.error.emit(f"Open failed: {e}")
@@ -315,7 +320,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.portBox = QtWidgets.QComboBox()
         self.refreshBtn = QtWidgets.QPushButton("Refresh")
         self.baudBox = QtWidgets.QComboBox()
-        self.baudBox.addItems(["9600", "19200"])
+        self.baudBox.addItems(["600", "1200", "2400", "4800", "9600", "19200"])
+        self.baudBox.setCurrentText("9600")  # keep 9600 as default
+
+        # === NEW: Data bits / Parity / Stop bits ===
+        self.dataBitsBox = QtWidgets.QComboBox()
+        self.dataBitsBox.addItems(["7", "8"])
+        self.dataBitsBox.setCurrentText("7")   # default for Modbus ASCII
+
+        self.parityBox = QtWidgets.QComboBox()
+        self.parityBox.addItems(["Even", "Odd", "None"])
+        self.parityBox.setCurrentText("Even")  # default for Modbus ASCII
+
+        self.stopBitsBox = QtWidgets.QComboBox()
+        self.stopBitsBox.addItems(["1", "2"])
+        self.stopBitsBox.setCurrentText("1")   # common default
 
         # Port toggle + status
         self.portToggleBtn = QtWidgets.QPushButton("Open Port")
@@ -332,8 +351,15 @@ class MainWindow(QtWidgets.QMainWindow):
         tl.addWidget(QtWidgets.QLabel("Port"), row, 0); tl.addWidget(self.portBox, row, 1)
         tl.addWidget(self.refreshBtn, row, 2)
         tl.addWidget(QtWidgets.QLabel("Baud"), row, 3); tl.addWidget(self.baudBox, row, 4)
-        tl.addWidget(self.portToggleBtn, row, 5)
-        tl.addWidget(self.portStatusDot, row, 6)
+
+        # === NEW: framing controls ===
+        tl.addWidget(QtWidgets.QLabel("Data bits"), row, 5); tl.addWidget(self.dataBitsBox, row, 6)
+        tl.addWidget(QtWidgets.QLabel("Parity"),    row, 7); tl.addWidget(self.parityBox,   row, 8)
+        tl.addWidget(QtWidgets.QLabel("Stop bits"), row, 9); tl.addWidget(self.stopBitsBox, row,10)
+
+        # Shift toggle + status to the right
+        tl.addWidget(self.portToggleBtn, row, 11)
+        tl.addWidget(self.portStatusDot, row, 12)
         tl.addItem(QtWidgets.QSpacerItem(20, 10,
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Minimum), row, 99)
@@ -519,6 +545,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 label = f"{p.device} – {p.description}"
                 self.portBox.addItem(label, userData=p.device)
 
+    def _selected_serial_params(self):
+        # map UI selections to pySerial constants
+        bytesize = serial.SEVENBITS if self.dataBitsBox.currentText() == "7" else serial.EIGHTBITS
+        parity_map = {"Even": serial.PARITY_EVEN, "Odd": serial.PARITY_ODD, "None": serial.PARITY_NONE}
+        parity = parity_map[self.parityBox.currentText()]
+        stopbits = serial.STOPBITS_ONE if self.stopBitsBox.currentText() == "1" else serial.STOPBITS_TWO
+        return bytesize, parity, stopbits
+
+
     def set_port_indicator(self, is_open: bool):
         if is_open:
             self.portToggleBtn.setText("Close Port")
@@ -559,7 +594,8 @@ class MainWindow(QtWidgets.QMainWindow):
         idx = self.portBox.currentIndex()
         port = self.portBox.itemData(idx) if idx >= 0 else None
         if port:
-            self.worker.open(port, baud)
+            bytesize, parity, stopbits = self._selected_serial_params()
+            self.worker.open(port, baud, bytesize, parity, stopbits)
             self.t0 = time.time()
             self.poll_once()
             self.pollTimer.start(self.pollMs.value())
