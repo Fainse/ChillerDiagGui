@@ -32,7 +32,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,  # UPX-packed executables are a common antivirus false-positive trigger
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -40,13 +40,14 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     contents_directory='deps',
+    version='version_info.txt',  # embeds file/product details shown in Properties > Details
 )
 coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='ChillerDiagGui',
 )

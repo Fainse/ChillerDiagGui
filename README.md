@@ -49,7 +49,18 @@ Default serial framing is 7E1 at 9600 baud; all settings can be changed in the U
 .venv38\Scripts\pyinstaller ChillerDiagGui.spec
 ```
 
-The app is written to `dist\ChillerDiagGui\` (`ChillerDiagGui.exe` plus a `deps` folder). Publish builds as GitHub Releases rather than committing them.
+The app is written to `dist\ChillerDiagGui\` (`ChillerDiagGui.exe` plus a `deps` folder). Ship the whole folder, and publish builds as GitHub Releases rather than committing them.
+
+File details shown in the exe's *Properties → Details* come from `version_info.txt`; bump the version numbers there for each release.
+
+### Antivirus / SmartScreen warnings
+
+Unsigned PyInstaller executables are sometimes flagged on Windows 10/11:
+
+- **"Windows protected your PC"** (blue SmartScreen screen) is a reputation check for unsigned downloads. Click *More info → Run anyway*; code-signing the exe removes it.
+- **"Threat found"** (e.g. `Trojan:Win32/Wacatac`) is a heuristic false positive. Report it at https://www.microsoft.com/wdsi/filesubmission ("incorrectly detected"), or have IT allowlist the install folder.
+
+The build already disables UPX compression and embeds version info, both of which reduce false positives.
 
 ---
 
