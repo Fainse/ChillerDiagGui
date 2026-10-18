@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Windows 7 compatible build: Python 3.8.x + PyQt5 5.15.x
-import sys, time, binascii, csv, math, collections
+import sys, time, binascii, csv, math, queue, threading
 from dataclasses import dataclass
 from typing import Dict, Callable, List, Tuple, Optional
 from PyQt5 import QtCore, QtWidgets
@@ -9,32 +9,20 @@ import pyqtgraph as pg
 
 # -------------------- Settings --------------------
 SLAVE_ID = 1
-
-# Older unit map blocks (read only what we need; reserved are ignored by not mapping)
-POLL_BLOCKS: List[Tuple[int, int]] = [
-    (0x0000, 0x000C),  # 0x0000 .. 0x000B (incl. setpoint at 0x000B)
-    (0x5200, 0x0002),  # 0x5200 .. 0x5201 (supply/return temps)
-]
 DEFAULT_BAUD = 9600
 
-# Serial defaults (user can override in UI)
-BYTESIZE = serial.SEVENBITS
-PARITY   = serial.PARITY_EVEN
-STOPBITS = serial.STOPBITS_ONE
-READ_TIMEOUT  = 0.5
+READ_TIMEOUT  = 0.05            # serial read granularity; keeps the worker responsive
 WRITE_TIMEOUT = 0.5
-INTER_REQUEST_DELAY_MS = 60     # small gap after each write
+RESPONSE_TIMEOUT = 0.5          # wait for a reply, on top of the frame transmit time
+INTER_REQUEST_DELAY_MS = 60     # small gap after each transaction
 
-# Command/Status (older unit)
-RUN_CMD_ADDR = 0x000C           # 0=stop, 1=run
-RUN_VALUE    = 0x0001
-STOP_VALUE   = 0x0000
-STATUS_ADDR  = 0x0004           # bit0 = Run flag
+STATUS_CONFIRM_DELAY_MS = 200   # give the unit time to update its run flag before reading back
+RUN_CONFIRM_RETRIES = 2         # extra Run/Stop writes if the status does not follow
 
-# Setpoint register (R/W)
-SETPOINT_ADDR = 0x000B          # 5.0..40.0°C (0.1°C units). 41..104°F
+MAX_HISTORY_POINTS = 1000       # per plotted field
+MAX_TABLE_ROWS = 2000           # on-screen log; oldest rows are dropped
 
-DEMO_MODE = False  # True = simulate without hardware; False = real serial
+DEMO_MODE = "--demo" in sys.argv  # simulate without hardware (python ChillerDiagGui.py --demo)
 
 # Distinct, colorblind-friendly palette (24 unique)
 PALETTE_HEX = [
@@ -44,33 +32,37 @@ PALETTE_HEX = [
     "#8C564B", "#1F77B4", "#2CA02C", "#D62728", "#9467BD", "#17BECF"
 ]
 
+# Heat transfer fluids: name -> (specific heat cal/g°C, density g/cm³)
+FLUIDS: Dict[str, Tuple[float, float]] = {
+    "Water":             (1.002, 1.00),
+    "Fluorinated Fluid": (0.23,  1.80),  # typical Fluorinert/Galden; check your fluid's datasheet
+}
+J_PER_CAL = 4.184
+
 # -------------------- Modbus ASCII helpers --------------------
 def lrc(bs: bytes) -> int:
     s = sum(bs) & 0xFF
     return (-s) & 0xFF
 
+def build_ascii_frame(pdu: bytes) -> bytes:
+    return b':' + binascii.hexlify(pdu + bytes([lrc(pdu)])).upper() + b'\r\n'
+
 def build_read_ascii(slave: int, start_addr: int, quantity: int) -> bytes:
-    pdu = bytes([
+    return build_ascii_frame(bytes([
         slave & 0xFF, 0x03,
         (start_addr >> 8) & 0xFF, start_addr & 0xFF,
         (quantity   >> 8) & 0xFF, quantity   & 0xFF
-    ])
-    chk = lrc(pdu)
-    return b':' + binascii.hexlify(pdu + bytes([chk])).upper() + b'\r\n'
+    ]))
 
 def build_write_single_register_ascii(slave: int, addr: int, value: int) -> bytes:
-    pdu = bytes([
+    return build_ascii_frame(bytes([
         slave & 0xFF, 0x06,
-        (addr >> 8) & 0xFF, addr & 0xFF,
+        (addr  >> 8) & 0xFF, addr  & 0xFF,
         (value >> 8) & 0xFF, value & 0xFF
-    ])
-    chk = lrc(pdu)
-    return b':' + binascii.hexlify(pdu + bytes([chk])).upper() + b'\r\n'
+    ]))
 
 def build_response_ascii(addr: int, func: int, data_bytes: bytes) -> bytes:
-    pdu = bytes([addr & 0xFF, func & 0xFF]) + data_bytes
-    chk = lrc(pdu)
-    return b':' + binascii.hexlify(pdu + bytes([chk])).upper() + b'\r\n'
+    return build_ascii_frame(bytes([addr & 0xFF, func & 0xFF]) + data_bytes)
 
 def parse_ascii_frame(line_between_colon_and_cr: bytes):
     try:
@@ -114,7 +106,7 @@ class ModbusAsciiParser:
         return out
 
 def parse_0x03_registers(data_bytes: bytes) -> List[int]:
-    if not data_bytes or len(data_bytes) < 1:
+    if not data_bytes:
         return []
     count = data_bytes[0]
     regs = []
@@ -123,225 +115,318 @@ def parse_0x03_registers(data_bytes: bytes) -> List[int]:
             regs.append((data_bytes[i] << 8) | data_bytes[i+1])
     return regs
 
-# -------------------- Register map & scaling --------------------
-@dataclass
-class FieldSpec:
-    addr: int
-    qty: int
-    scale: Callable[[List[int]], float]
-    unit: str
-
+# -------------------- Scaling --------------------
 def s16(x: int) -> int:
     return x - 0x10000 if x >= 0x8000 else x
 
-def scale_temp10_signed(regs: List[int])   -> float: return s16(regs[0]) / 10.0
-def scale_temp10_unsigned(regs: List[int]) -> float: return regs[0] / 10.0
-def scale_pressure_01mpa(regs: List[int])  -> float: return regs[0] * 0.01
-def scale_cond_01uScm(regs: List[int])     -> float: return regs[0] * 0.1
-def scale_identity(regs: List[float])      -> float: return float(regs[0]) if regs else 0.0
+def scale_temp10_signed(raw: int)    -> float: return s16(raw) / 10.0
+def scale_temp10_unsigned(raw: int)  -> float: return raw / 10.0
+def scale_temp100_signed(raw: int)   -> float: return s16(raw) / 100.0
+def scale_temp100_unsigned(raw: int) -> float: return raw / 100.0
+def scale_pressure_01mpa(raw: int)   -> float: return raw * 0.01
+def scale_cond_01uScm(raw: int)      -> float: return raw * 0.1
 
-FIELD_MAP: Dict[str, FieldSpec] = {
-    # 0x0000 block
-    "Discharge Temp (°C)":        FieldSpec(0x0000, 1, scale_temp10_signed, "°C"),
-    "Discharge Pressure (MPa)":   FieldSpec(0x0002, 1, scale_pressure_01mpa, "MPa"),
-    "Fluid Conductivity (µS/cm)": FieldSpec(0x0003, 1, scale_cond_01uScm, "µS/cm"),
-    "Fluid Set Temp (°C)":        FieldSpec(SETPOINT_ADDR, 1, scale_temp10_unsigned, "°C"),
+def to_raw(value: float, counts_per_unit: int) -> int:
+    return int(round(value * counts_per_unit)) & 0xFFFF
 
-    # 0x5200 block
-    "Supply Temp (°C)":           FieldSpec(0x5200, 1, scale_temp10_signed, "°C"),
-    "Return Temp (°C)":           FieldSpec(0x5201, 1, scale_temp10_signed, "°C"),
+# -------------------- Chiller models (register maps) --------------------
+@dataclass
+class FieldSpec:
+    addr: int
+    scale: Callable[[int], float]
+    unit: str
 
-    # Derived (virtual) channel
-    "Heat Transfer (W)":          FieldSpec(-1, 0, scale_identity, "W"),
-}
+@dataclass
+class HeatTransferSpec:
+    outlet_addr: int                # fluid leaving the chiller (to the load)
+    return_addr: int                # fluid returning from the load
+    scale: Callable[[int], float]   # raw -> °C
+
+@dataclass
+class ChillerModel:
+    name: str
+    poll_blocks: List[Tuple[int, int]]       # (start, quantity) read with 0x03
+    run_cmd_addr: int                        # 0=stop, 1=run
+    status_addr: int                         # bit0 = run flag
+    setpoint_addr: int
+    setpoint_counts_per_c: int               # 10 -> 0.1°C units, 100 -> 0.01°C units
+    setpoint_range_c: Tuple[float, float]
+    fields: Dict[str, FieldSpec]
+    heat_transfer: Optional[HeatTransferSpec]
+    demo_registers: Callable[[float, Dict[int, int]], Dict[int, int]]  # (t, written regs) -> regs
+
+    @property
+    def setpoint_decimals(self) -> int:
+        return int(round(math.log10(self.setpoint_counts_per_c)))
+
+HEAT_TRANSFER_FIELD = "Heat Transfer (W)"
+RUN_VALUE, STOP_VALUE = 0x0001, 0x0000
+
+def _demo_standard(t: float, written: Dict[int, int]) -> Dict[int, int]:
+    return {
+        0x0000: to_raw(25 + 5*math.sin(t/6.0), 10),        # discharge temp
+        0x0002: 12,                                       # 0.12 MPa
+        0x0003: 150,                                      # 15.0 µS/cm
+        0x0004: 1 if written.get(0x000C, 0) else 0,       # status bit0
+        0x000B: written.get(0x000B, to_raw(22.0, 10)),    # setpoint
+        0x5200: to_raw(24 + 3*math.sin(t/7.0), 10),        # supply
+        0x5201: to_raw(26.5 + 3*math.sin(t/7.0 + 1.0), 10),  # return
+    }
+
+def _demo_hec(t: float, written: Dict[int, int]) -> Dict[int, int]:
+    internal = 25 + 5*math.sin(t/6.0)
+    external = 25 + 3*math.sin(t/7.0)
+    return {
+        0x0040: to_raw(internal, 100),
+        0x0041: to_raw(external, 100),
+        0x0042: to_raw((internal + external) / 2.0, 100),
+        0x0043: 1 if written.get(0x0050, 0) else 0,
+        0x0051: written.get(0x0051, to_raw(22.0, 100)),
+    }
+
+MODELS: List[ChillerModel] = [
+    ChillerModel(
+        name="Standard (0x0000 / 0x5200 map)",
+        poll_blocks=[
+            (0x0000, 0x000C),  # 0x0000 .. 0x000B (incl. setpoint at 0x000B)
+            (0x5200, 0x0002),  # 0x5200 .. 0x5201 (supply/return temps)
+        ],
+        run_cmd_addr=0x000C,
+        status_addr=0x0004,
+        setpoint_addr=0x000B,
+        setpoint_counts_per_c=10,
+        setpoint_range_c=(5.0, 40.0),
+        fields={
+            "Discharge Temp (°C)":        FieldSpec(0x0000, scale_temp10_signed, "°C"),
+            "Discharge Pressure (MPa)":   FieldSpec(0x0002, scale_pressure_01mpa, "MPa"),
+            "Fluid Conductivity (µS/cm)": FieldSpec(0x0003, scale_cond_01uScm, "µS/cm"),
+            "Fluid Set Temp (°C)":        FieldSpec(0x000B, scale_temp10_unsigned, "°C"),
+            "Supply Temp (°C)":           FieldSpec(0x5200, scale_temp10_signed, "°C"),
+            "Return Temp (°C)":           FieldSpec(0x5201, scale_temp10_signed, "°C"),
+        },
+        heat_transfer=HeatTransferSpec(outlet_addr=0x0000, return_addr=0x5201,
+                                       scale=scale_temp10_signed),
+        demo_registers=_demo_standard,
+    ),
+    ChillerModel(
+        name="HEC (0x0040 map)",
+        poll_blocks=[(0x0040, 0x0012)],  # 0x0040 .. 0x0051
+        run_cmd_addr=0x0050,
+        status_addr=0x0043,
+        setpoint_addr=0x0051,
+        setpoint_counts_per_c=100,
+        setpoint_range_c=(10.0, 60.0),
+        fields={
+            "Internal Temp (°C)":  FieldSpec(0x0040, scale_temp100_signed, "°C"),
+            "External Temp (°C)":  FieldSpec(0x0041, scale_temp100_signed, "°C"),
+            "Average Temp (°C)":   FieldSpec(0x0042, scale_temp100_signed, "°C"),
+            "Fluid Set Temp (°C)": FieldSpec(0x0051, scale_temp100_unsigned, "°C"),
+        },
+        heat_transfer=None,
+        demo_registers=_demo_hec,
+    ),
+]
+
+# -------------------- Transactions --------------------
+@dataclass
+class Request:
+    kind: str             # "poll", "run" or "setpoint"
+    func: int             # 0x03 or 0x06
+    addr: int
+    qty: int              # register count (0x03) or value written (0x06)
+    frame: bytes
+    cycle: int = 0        # poll cycle this request belongs to
+    note: str = ""        # status text shown when the request succeeds
+
+    @property
+    def reply_len(self) -> int:
+        """Expected reply length in ASCII characters (':' + hex + CRLF)."""
+        if self.func == 0x03:
+            return 11 + 4 * self.qty
+        return len(self.frame)  # 0x06 reply echoes the request
+
+def read_request(start: int, qty: int, cycle: int) -> Request:
+    return Request("poll", 0x03, start, qty, build_read_ascii(SLAVE_ID, start, qty), cycle)
+
+def write_request(kind: str, addr: int, value: int, note: str = "") -> Request:
+    return Request(kind, 0x06, addr, value,
+                   build_write_single_register_ascii(SLAVE_ID, addr, value), note=note)
 
 # -------------------- Serial worker --------------------
 class SerialWorker(QtCore.QThread):
-    frameParsed = QtCore.pyqtSignal(int, int, bytes)
-    status      = QtCore.pyqtSignal(str)
-    error       = QtCore.pyqtSignal(str)
+    """Owns the serial port and runs one request/reply transaction at a time.
+
+    Every request gets exactly one replied or failed signal (unless the port closes
+    first), so replies can never be matched to the wrong request.
+    """
+    replied = QtCore.pyqtSignal(object, bytes, bytes)  # request, data, rx frame
+    failed  = QtCore.pyqtSignal(object, str)           # request, reason
+    status  = QtCore.pyqtSignal(str)
+    error   = QtCore.pyqtSignal(str)
+    closed  = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
         self.ser = None
-        self._run = False
-        self.parser = ModbusAsciiParser()
-        self.tx_queue: List[bytes] = []
+        self._requests: "queue.Queue[Request]" = queue.Queue()
+        self._stop = threading.Event()
+        self._char_time = 0.0
 
     def is_open(self) -> bool:
-        try:
-            return bool(self._run and self.ser and self.ser.is_open)
-        except Exception:
-            return False
+        return self.isRunning() and not self._stop.is_set()
 
-    def open(self, port: str, baud: int, bytesize, parity, stopbits):
-        try:
-            self.ser = serial.Serial(
-                port=port, baudrate=baud,
-                bytesize=bytesize, parity=parity, stopbits=stopbits,
-                timeout=READ_TIMEOUT, write_timeout=WRITE_TIMEOUT
-            )
-            self._run = True
-            if not self.isRunning():
-                self.start()
-            p = {serial.PARITY_NONE: "N", serial.PARITY_EVEN: "E", serial.PARITY_ODD: "O"}.get(parity, "?")
-            db = 7 if bytesize == serial.SEVENBITS else 8
-            sb = 1 if stopbits == serial.STOPBITS_ONE else 2
-            self.status.emit(f"Opened {port} @ {baud} ({db}{p}{sb})")
-        except Exception as e:
-            self.ser = None
-            self.error.emit(f"Open failed: {e}")
+    def open(self, ser, char_time: float, label: str) -> bool:
+        """Start a session on an already-opened port; the worker thread owns it from here."""
+        if self.isRunning():
+            self.error.emit("Port is still closing, try again")
+            try: ser.close()
+            except Exception: pass
+            return False
+        self.ser = ser
+        self._char_time = char_time
+        self._stop.clear()
+        self._drain()
+        self.start()
+        self.status.emit(f"Opened {label}")
+        return True
 
     def close(self):
-        self._run = False
-        if self.ser:
+        """Ask the worker thread to close the port and wait until it has."""
+        self._stop.set()
+        self.wait()
+
+    def send(self, req: Request):
+        self._requests.put(req)
+
+    def _drain(self):
+        while True:
+            try: self._requests.get_nowait()
+            except queue.Empty: break
+
+    def run(self):
+        try:
+            while not self._stop.is_set():
+                try:
+                    req = self._requests.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                self._transact(req)
+        except Exception as e:
+            self.error.emit(f"Serial error: {e}")
+        finally:
             try: self.ser.close()
             except Exception: pass
             self.ser = None
-            self.status.emit("Port closed")
+            self._stop.set()
+            self._drain()
+            self.closed.emit()
 
-    @QtCore.pyqtSlot(bytes)
-    def send(self, frame: bytes):
-        self.tx_queue.append(frame)
-
-    def run(self):
-        while True:
-            if not self._run or not self.ser:
-                time.sleep(0.05)
-                if not self._run and not self.ser:
-                    break
-                continue
-
-            while self.tx_queue:
-                frame = self.tx_queue.pop(0)
-                try:
-                    self.ser.write(frame)
-                    self.ser.flush()
-                    time.sleep(INTER_REQUEST_DELAY_MS / 1000.0)
-                except Exception as e:
-                    self.error.emit(f"Write error: {e}")
-
+    def _transact(self, req: Request):
+        ser = self.ser
+        try:
+            ser.reset_input_buffer()  # drop late/stray bytes from earlier transactions
             try:
-                chunk = self.ser.read(256)
-                if chunk:
-                    for (addr, func, data) in self.parser.feed(chunk):
-                        self.frameParsed.emit(addr, func, data)
-            except Exception as e:
-                self.error.emit(f"Read error: {e}")
-                self.close()
+                ser.write(req.frame)
+                ser.flush()
+            except serial.SerialTimeoutException:
+                self.failed.emit(req, "write timeout")
+                return
 
-# -------------------- Demo worker (no hardware needed) --------------------
-class DemoWorker(QtCore.QThread):
-    frameParsed = QtCore.pyqtSignal(int, int, bytes)
-    status      = QtCore.pyqtSignal(str)
-    error       = QtCore.pyqtSignal(str)
+            parser = ModbusAsciiParser()
+            deadline = (time.monotonic() + RESPONSE_TIMEOUT
+                        + (len(req.frame) + req.reply_len) * self._char_time)
+            while not self._stop.is_set() and time.monotonic() < deadline:
+                chunk = ser.read(ser.in_waiting or 1)
+                for addr, func, data in parser.feed(chunk):
+                    if addr != SLAVE_ID:
+                        continue
+                    if func == (req.func | 0x80):
+                        code = data[0] if data else 0
+                        self.failed.emit(req, f"Modbus exception {code:#04x}")
+                        return
+                    if func != req.func:
+                        continue
+                    # Ignore frames of the wrong size (e.g. our own request echoed on 2-wire RS-485)
+                    if func == 0x03 and (not data or data[0] != 2 * req.qty or len(data) != 1 + 2 * req.qty):
+                        continue
+                    self.replied.emit(req, data, build_response_ascii(addr, func, data))
+                    return
+            if not self._stop.is_set():
+                self.failed.emit(req, "no response (timeout)")
+        finally:
+            time.sleep(INTER_REQUEST_DELAY_MS / 1000.0)
 
-    def __init__(self):
-        super().__init__()
-        self._run = False
-        self.tx_queue: List[bytes] = []
+# -------------------- Demo port (no hardware needed) --------------------
+class DemoSerial:
+    """Stands in for serial.Serial and answers like a chiller of the given model."""
+    def __init__(self, model: ChillerModel):
+        self.model = model
+        self.is_open = True
+        self._rx = bytearray()
+        self._parser = ModbusAsciiParser()
+        self._written: Dict[int, int] = {}
         self._t0 = time.time()
-        self._timer = QtCore.QTimer()
-        self._timer.setInterval(100)
-        self._timer.timeout.connect(self._process)
-        self._run_state = 0  # 0=OFF, 1=ON
-        self._setpoint_raw = int(round(22.0 * 10))  # 22.0°C in 0.1°C
-        self._press_raw = 12   # 0.12 MPa
-        self._cond_raw  = 150  # 15.0 µS/cm
 
-    def is_open(self) -> bool:
-        return bool(self._run)
+    @property
+    def in_waiting(self) -> int:
+        return len(self._rx)
 
-    def open(self, port: str, baud: int):
-        self._run = True
-        if not self.isRunning():
-            self.start()
-        self._timer.start()
-        self.status.emit(f"(DEMO) Opened virtual device @ {baud} (7E1)")
+    def reset_input_buffer(self):
+        self._rx.clear()
+
+    def write(self, frame: bytes):
+        for addr, func, data in self._parser.feed(frame):
+            if addr != SLAVE_ID or len(data) < 4:
+                continue
+            reg = (data[0] << 8) | data[1]
+            arg = (data[2] << 8) | data[3]
+            if func == 0x03:
+                regs = self.model.demo_registers(time.time() - self._t0, self._written)
+                payload = bytearray([2 * arg])
+                for a in range(reg, reg + arg):
+                    v = regs.get(a, 0)
+                    payload.extend([(v >> 8) & 0xFF, v & 0xFF])
+                self._rx.extend(build_response_ascii(addr, func, bytes(payload)))
+            elif func == 0x06:
+                self._written[reg] = arg
+                self._rx.extend(build_response_ascii(addr, func, data[:4]))
+        return len(frame)
+
+    def flush(self):
+        pass
+
+    def read(self, n: int = 1) -> bytes:
+        if not self._rx:
+            time.sleep(READ_TIMEOUT)
+            return b''
+        out = bytes(self._rx[:n])
+        del self._rx[:n]
+        return out
 
     def close(self):
-        self._run = False
-        self._timer.stop()
-        self.status.emit("(DEMO) Port closed")
-
-    @QtCore.pyqtSlot(bytes)
-    def send(self, frame: bytes):
-        try:
-            if not frame or frame[0:1] != b':' or not frame.endswith(b'\r\n'):
-                return
-            raw = binascii.unhexlify(frame[1:-2])
-        except Exception:
-            return
-        if len(raw) < 3:
-            return
-        func = raw[1]
-        if func == 0x03:
-            self.tx_queue.append(b'R')
-        elif func == 0x06:
-            if len(raw) >= 7:
-                reg_addr = (raw[2] << 8) | raw[3]
-                reg_val  = (raw[4] << 8) | raw[5]
-                if reg_addr == RUN_CMD_ADDR:
-                    self._run_state = 1 if reg_val != 0 else 0
-                elif reg_addr == SETPOINT_ADDR:
-                    self._setpoint_raw = reg_val
-            self.frameParsed.emit(SLAVE_ID, 0x06, b'')
-
-    def run(self):
-        loop = QtCore.QEventLoop()
-        while self._run:
-            loop.processEvents(QtCore.QEventLoop.AllEvents, 50)
-            time.sleep(0.01)
-
-    def _process(self):
-        if not self._run or not self.tx_queue:
-            return
-        _ = self.tx_queue.pop(0)
-
-        t = time.time() - self._t0
-
-        # Block 0: 0x0000..0x000B
-        regs0 = [0]*0x000C
-        regs0[0]  = int(round((25 + 5*math.sin(t/6.0))*10))  # discharge temp
-        regs0[2]  = self._press_raw                          # 0.01 MPa/dig
-        regs0[3]  = self._cond_raw                           # 0.1 µS/cm/dig
-        regs0[4]  = 1 if self._run_state else 0              # status
-        regs0[11] = self._setpoint_raw                       # setpoint
-
-        bc0 = len(regs0)*2
-        payload0 = bytearray([bc0])
-        for v in regs0:
-            payload0.extend([(v>>8)&0xFF, v&0xFF])
-        self.frameParsed.emit(SLAVE_ID, 0x03, bytes(payload0))
-
-        # Block 1: 0x5200..0x5201
-        regs1 = [0]*0x0002
-        supply = int(round((24 + 3*math.sin(t/7.0))*10))
-        ret    = int(round((24.5 + 3*math.sin(t/7.0 + 1.0))*10))
-        regs1[0] = supply
-        regs1[1] = ret
-
-        bc1 = len(regs1)*2
-        payload1 = bytearray([bc1])
-        for v in regs1:
-            payload1.extend([(v>>8)&0xFF, v&0xFF])
-        self.frameParsed.emit(SLAVE_ID, 0x03, bytes(payload1))
+        self.is_open = False
 
 # -------------------- Main GUI --------------------
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SMC Diagnostics (Win7/PyQt5)")
+        self.setWindowTitle("SMC Chiller Diagnostics (Win7/PyQt5)" + (" — DEMO" if DEMO_MODE else ""))
+
+        self.model: ChillerModel = MODELS[0]
 
         # Worker
-        self.worker = DemoWorker() if DEMO_MODE else SerialWorker()
+        self.worker = SerialWorker()
         self.worker.status.connect(self.on_status)
         self.worker.error.connect(self.on_error)
-        self.worker.frameParsed.connect(self.on_frame)
+        self.worker.replied.connect(self.on_reply)
+        self.worker.failed.connect(self.on_request_failed)
+        self.worker.closed.connect(self.on_worker_closed)
 
-        # Per-block TX/RX frames + queue of outstanding blocks
-        self._block_frames: Dict[Tuple[int,int], Tuple[bytes,bytes]] = {}
-        self._awaiting: collections.deque[Tuple[int,int]] = collections.deque()
+        # Poll cycle state
+        self._cycle = 0
+        self._cycle_outstanding = 0
+        self._cycle_snapshot: Dict[int, int] = {}
+        self._block_frames: Dict[Tuple[int, int], Tuple[bytes, bytes]] = {}  # last TX/RX per block
 
         # Pens / colors
         self._pen_cache: Dict[str, pg.mkPen] = {}
@@ -358,7 +443,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refreshBtn = QtWidgets.QPushButton("Refresh")
         self.baudBox = QtWidgets.QComboBox()
         self.baudBox.addItems(["600", "1200", "2400", "4800", "9600", "19200"])
-        self.baudBox.setCurrentText("9600")
+        self.baudBox.setCurrentText(str(DEFAULT_BAUD))
 
         self.dataBitsBox = QtWidgets.QComboBox(); self.dataBitsBox.addItems(["7","8"]); self.dataBitsBox.setCurrentText("7")
         self.parityBox   = QtWidgets.QComboBox(); self.parityBox.addItems(["Even","Odd","None"]); self.parityBox.setCurrentText("Even")
@@ -371,6 +456,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.portStatusDot.setStyleSheet("color:#cc0000; font-weight:600;")
 
         self.pollMs = QtWidgets.QSpinBox(); self.pollMs.setRange(100,10000); self.pollMs.setValue(1000)
+
+        self.modelBox = QtWidgets.QComboBox()
+        self.modelBox.addItems([m.name for m in MODELS])
 
         row = 0
         tl.addWidget(QtWidgets.QLabel("Port"), row, 0); tl.addWidget(self.portBox, row, 1)
@@ -394,14 +482,12 @@ class MainWindow(QtWidgets.QMainWindow):
         tl.addWidget(QtWidgets.QLabel("Chiller Control"), row, 3)
         tl.addWidget(self.chillerToggleBtn, row, 4)
         tl.addWidget(self.statusDot, row, 5)
-        tl.addItem(QtWidgets.QSpacerItem(20,10,QtWidgets.QSizePolicy.Expanding,QtWidgets.QSizePolicy.Minimum), row, 99)
+        tl.addWidget(QtWidgets.QLabel("Model"), row, 7); tl.addWidget(self.modelBox, row, 8, 1, 3)
 
         # -------- Fluid Set Temp (write) --------
         row += 1
         tl.addWidget(QtWidgets.QLabel("Fluid Set Temp"), row, 0)
         self.setTempSpin = QtWidgets.QDoubleSpinBox()
-        self.setTempSpin.setDecimals(1)
-        self.setTempSpin.setSingleStep(0.1)
         self.setTempSpin.setKeyboardTracking(False)
         self.setTempSpin.setAccelerated(True)
         self.setTempSpin.setRange(-999.0, 999.0)
@@ -415,38 +501,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.writeSetTempBtn = QtWidgets.QPushButton("Set")
         self.writeSetTempBtn.clicked.connect(self.write_setpoint)
 
-        self.setTempReadLbl = QtWidgets.QLabel("Last read: --.- °C"); self.setTempReadLbl.setStyleSheet("color:#BBBBBB;")
+        self.setTempReadLbl = QtWidgets.QLabel(); self.setTempReadLbl.setStyleSheet("color:#BBBBBB;")
+        self._last_setpoint_c: Optional[float] = None
 
         tl.addWidget(self.setTempSpin, row, 1)
         tl.addWidget(self.setTempUnit, row, 2)
         tl.addWidget(self.writeSetTempBtn, row, 3)
         tl.addWidget(self.setTempReadLbl, row, 4, 1, 3)
 
-        # --- Heat Transfer inputs ---
+        # --- Heat Transfer inputs (models with supply/return temps only) ---
         row += 1
-        tl.addWidget(QtWidgets.QLabel("Flow Rate (L/min)"), row, 0)
+        flowLbl = QtWidgets.QLabel("Flow Rate (L/min)")
         self.flowSpin = QtWidgets.QDoubleSpinBox()
         self.flowSpin.setDecimals(1)
         self.flowSpin.setMinimum(0.0)
         self.flowSpin.setMaximum(9999999)   # effectively unlimited
         self.flowSpin.setSingleStep(0.10)
         self.flowSpin.setValue(5.0)
-        tl.addWidget(self.flowSpin, row, 1)
-
-        tl.addWidget(QtWidgets.QLabel("Fluid Type"), row, 2)
+        fluidLbl = QtWidgets.QLabel("Fluid Type")
         self.fluidTypeBox = QtWidgets.QComboBox()
-        self.fluidTypeBox.addItems(["Water", "Fluorinated Fluid"])
-        self.fluidTypeBox.setCurrentIndex(0)
-        tl.addWidget(self.fluidTypeBox, row, 3)
+        self.fluidTypeBox.addItems(list(FLUIDS))
+        tl.addWidget(flowLbl, row, 0); tl.addWidget(self.flowSpin, row, 1)
+        tl.addWidget(fluidLbl, row, 2); tl.addWidget(self.fluidTypeBox, row, 3)
+        self._heat_widgets = [flowLbl, self.flowSpin, fluidLbl, self.fluidTypeBox]
 
-        # Field list
+        # Field list (filled per model)
         self.fieldList = QtWidgets.QListWidget()
         self.fieldList.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-        for name in FIELD_MAP:
-            it = QtWidgets.QListWidgetItem(name)
-            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
-            it.setCheckState(QtCore.Qt.Unchecked)
-            self.fieldList.addItem(it)
         self.fieldList.itemChanged.connect(self.on_field_check)
 
         # -------- Plot (dual Y axes) --------
@@ -458,14 +539,10 @@ class MainWindow(QtWidgets.QMainWindow):
         pi = self.plot.getPlotItem()
         for axis in ['bottom','left','right']:
             pi.showAxis(axis, True)
-
-        for axis in ['bottom','left']:
             ax = pi.getAxis(axis)
             ax.setPen('k'); ax.setTextPen('k')
         self.plot.setLabel('bottom', 'Time', 's')
         self.plot.setLabel('left', 'Value')
-
-        pi.getAxis('right').setPen('k'); pi.getAxis('right').setTextPen('k')
         pi.getAxis('right').setLabel('Heat Transfer', units='W')
 
         # Right ViewBox (for Heat Transfer), X-linked to left
@@ -480,28 +557,12 @@ class MainWindow(QtWidgets.QMainWindow):
         pi.vb.sigResized.connect(_update_views)
         _update_views()
 
-        # Legend (auto-add for left curves; manual for right)
+        # Legend entries are managed manually (curves are created without a name)
         self.legend = self.plot.addLegend()
-        self.legend.setVisible(True)
-        self.right_in_legend: set = set()  # names added manually
 
         # Curve registries
         self.left_curves: Dict[str, pg.PlotDataItem] = {}
         self.right_curves: Dict[str, pg.PlotDataItem] = {}
-
-        # Pen factory
-        def _pen_for(name: str) -> pg.mkPen:
-            if name in self._pen_cache:
-                return self._pen_cache[name]
-            if self._palette_i < len(PALETTE_HEX):
-                color = PALETTE_HEX[self._palette_i]; self._palette_i += 1
-            else:
-                i = self._palette_i; self._palette_i += 1
-                color = pg.intColor((i * 7) % 36, hues=36)
-            pen = pg.mkPen(color, width=2.5, cosmetic=True)
-            self._pen_cache[name] = pen
-            return pen
-        self._pen_for = _pen_for
 
         self.history: Dict[str, Tuple[List[float], List[float]]] = {}
         self.t0 = time.time()
@@ -509,6 +570,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Table/log (on-screen) with TX/RX per-row
         self.table = QtWidgets.QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Timestamp","Field","Value","S (ASCII)","R (ASCII)"])
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.setColumnWidth(4, 530)
 
         # Saving
@@ -518,15 +580,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.saving_active = False
         self.csv_file = None
         self.csv_writer = None
-        self.csv_header_written = False
         self.save_fields: List[str] = []
 
         # Pending run/confirm/retry flow
         self._pending_run: Optional[bool] = None
         self._pending_attempts = 0
-        self._confirm_timer = QtCore.QTimer(self)
-        self._confirm_timer.setSingleShot(True)
-        self._confirm_timer.timeout.connect(self._confirm_run_state)
+        self._confirm_queued = False      # read back status once the current poll finishes
+        self._confirm_cycle: Optional[int] = None
 
         # Layout middle
         mid = QtWidgets.QSplitter()
@@ -544,6 +604,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Signals
         self.refreshBtn.clicked.connect(self.refresh_ports)
         self.pollMs.valueChanged.connect(self.on_poll_interval_changed)
+        self.modelBox.currentIndexChanged.connect(self.on_model_changed)
 
         # Timers
         self.pollTimer = QtCore.QTimer()
@@ -568,6 +629,48 @@ class MainWindow(QtWidgets.QMainWindow):
             }
         """)
         self.refresh_ports()
+        self.apply_model(self.model)
+
+    # --------- Model selection ----------
+    def on_model_changed(self, idx: int):
+        self.apply_model(MODELS[idx])
+
+    def apply_model(self, model: ChillerModel):
+        self.model = model
+
+        # Field list
+        self.fieldList.blockSignals(True)
+        self.fieldList.clear()
+        for name in self.field_names():
+            it = QtWidgets.QListWidgetItem(name)
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.Unchecked)
+            self.fieldList.addItem(it)
+        self.fieldList.blockSignals(False)
+
+        # Setpoint control
+        self.setTempSpin.setDecimals(model.setpoint_decimals)
+        self.setTempSpin.setSingleStep(1.0 / model.setpoint_counts_per_c if model.setpoint_decimals < 2 else 0.05)
+        self._last_setpoint_c = None
+        self._update_setpoint_label()
+
+        # Heat transfer inputs + right axis
+        has_heat = model.heat_transfer is not None
+        for w in self._heat_widgets:
+            w.setVisible(has_heat)
+        self.plot.getPlotItem().showAxis('right', has_heat)
+
+        # Reset data from the previous model
+        self.history.clear()
+        self._block_frames.clear()
+        self.table.setRowCount(0)
+        self.update_plot()
+
+    def field_names(self) -> List[str]:
+        names = list(self.model.fields)
+        if self.model.heat_transfer:
+            names.append(HEAT_TRANSFER_FIELD)
+        return names
 
     # --------- Unit helpers ----------
     @staticmethod
@@ -577,19 +680,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_settemp_unit_changed(self, _idx: int):
         new_unit = self.setTempUnit.currentText()
-        old_unit = getattr(self, "_settemp_unit", "°C")
+        old_unit = self._settemp_unit
         val = self.setTempSpin.value()
-        if old_unit != new_unit:
-            if old_unit == "°C" and new_unit == "°F":
-                val = round(self.c_to_f(val), 1)
-            elif old_unit == "°F" and new_unit == "°C":
-                val = round(self.f_to_c(val), 1)
+        decimals = self.model.setpoint_decimals
+        if old_unit == "°C" and new_unit == "°F":
+            val = round(self.c_to_f(val), decimals)
+        elif old_unit == "°F" and new_unit == "°C":
+            val = round(self.f_to_c(val), decimals)
         self.setTempSpin.blockSignals(True)
         self.setTempSpin.setSuffix(" " + new_unit)
-        self.setTempSpin.setRange(-999.0, 999.0)
         self.setTempSpin.setValue(val)
         self.setTempSpin.blockSignals(False)
         self._settemp_unit = new_unit
+        self._update_setpoint_label()
+
+    def _update_setpoint_label(self):
+        decimals = self.model.setpoint_decimals
+        unit = self.setTempUnit.currentText()
+        if self._last_setpoint_c is None:
+            text = "--." + "-" * decimals
+        else:
+            val = self._last_setpoint_c if unit == "°C" else self.c_to_f(self._last_setpoint_c)
+            text = f"{val:.{decimals}f}"
+        self.setTempReadLbl.setText(f"Last read: {text} {unit}")
 
     # --------- UI helpers ----------
     def refresh_ports(self):
@@ -613,53 +726,88 @@ class MainWindow(QtWidgets.QMainWindow):
     def set_port_indicator(self, is_open: bool):
         if is_open:
             self.portToggleBtn.setText("Close Port")
-            self.portToggleBtn.setChecked(True)
             self.portStatusDot.setText("● Open")
             self.portStatusDot.setStyleSheet("color:#1a7f37; font-weight:600;")
-            self.portBox.setEnabled(False); self.refreshBtn.setEnabled(False)
         else:
             self.portToggleBtn.setText("Open Port")
-            self.portToggleBtn.setChecked(False)
             self.portStatusDot.setText("● Closed")
             self.portStatusDot.setStyleSheet("color:#cc0000; font-weight:600;")
-            self.portBox.setEnabled(True); self.refreshBtn.setEnabled(False if DEMO_MODE else True)
+        self.portToggleBtn.setChecked(is_open)
+        for w in (self.portBox, self.modelBox, self.baudBox, self.dataBitsBox, self.parityBox, self.stopBitsBox):
+            w.setEnabled(not is_open)
+        self.refreshBtn.setEnabled(not is_open and not DEMO_MODE)
 
     # --------- Port open/close ---------
     def toggle_port(self):
-        if hasattr(self.worker, "is_open") and self.worker.is_open():
+        if self.worker.is_open():
             self.close_port()
         else:
             self.open_port()
 
     def open_port(self):
-        if hasattr(self.worker, "is_open") and self.worker.is_open():
+        if self.worker.is_open():
             self.on_status("Port already open"); return
         baud = int(self.baudBox.currentText()) if self.baudBox.currentText() else DEFAULT_BAUD
-        if DEMO_MODE:
-            self.worker.open("DEMO", baud)
-            self.t0 = time.time()
-            self.poll_once()
-            self.pollTimer.start(self.pollMs.value())
-            self.set_port_indicator(True)
-            return
+        bytesize, parity, stopbits = self._selected_serial_params()
+        bits_per_char = (1 + (7 if bytesize == serial.SEVENBITS else 8)
+                         + (0 if parity == serial.PARITY_NONE else 1)
+                         + (1 if stopbits == serial.STOPBITS_ONE else 2))
+        framing = "{}{}{}".format(7 if bytesize == serial.SEVENBITS else 8, parity,
+                                  1 if stopbits == serial.STOPBITS_ONE else 2)
+
         idx = self.portBox.currentIndex()
         port = self.portBox.itemData(idx) if idx >= 0 else None
-        if port:
-            bytesize, parity, stopbits = self._selected_serial_params()
-            self.worker.open(port, baud, bytesize, parity, stopbits)
-            self.t0 = time.time()
-            self.poll_once()
-            self.pollTimer.start(self.pollMs.value())
-            self.set_port_indicator(True)
-        else:
+        if not port:
             self.on_status("No port selected")
+            self.set_port_indicator(False)
+            return
+        try:
+            if DEMO_MODE:
+                ser = DemoSerial(self.model)
+                label = f"(DEMO) virtual {self.model.name} @ {baud} ({framing})"
+            else:
+                ser = serial.Serial(
+                    port=port, baudrate=baud,
+                    bytesize=bytesize, parity=parity, stopbits=stopbits,
+                    timeout=READ_TIMEOUT, write_timeout=WRITE_TIMEOUT
+                )
+                label = f"{port} @ {baud} ({framing})"
+        except Exception as e:
+            self.on_error(f"Open failed: {e}")
+            self.set_port_indicator(False)
+            return
+
+        if not self.worker.open(ser, bits_per_char / baud, label):
+            self.set_port_indicator(False)
+            return
+        self.t0 = time.time()
+        self.set_port_indicator(True)
+        self.poll_once()
+        self.pollTimer.start(self.pollMs.value())
 
     def close_port(self):
+        self.worker.close()  # on_worker_closed resets the UI
+        self.on_status("Port closed")
+
+    def on_worker_closed(self):
         if self.pollTimer.isActive(): self.pollTimer.stop()
-        self.worker.close()
+        self._cycle_outstanding = 0
+        self._cycle_snapshot = {}
+        self._confirm_queued = False
+        self._confirm_cycle = None
+        if self._pending_run is not None:
+            self._pending_run = None
+            self.chillerToggleBtn.setEnabled(True)
         self.set_port_indicator(False)
         if self.saving_active:
             self.saveToggleBtn.setChecked(False)
+
+    def closeEvent(self, event):
+        if self.worker.isRunning():
+            self.worker.close()
+        if self.saving_active:
+            self.toggle_saving(False)
+        super().closeEvent(event)
 
     # --------- Status + chiller control ----------
     def on_status(self, s: str): self.statusBar().showMessage(s, 5000)
@@ -675,286 +823,229 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chillerToggleBtn.setText("Turn Chiller OFF" if running else "Turn Chiller ON")
         self.chillerToggleBtn.blockSignals(False)
 
-    # ---- Write→confirm→retry flow ----
-    def _request_status_reads(self, delay_ms=180):
-        def _send_all():
-            for start, qty in POLL_BLOCKS:
-                frame = build_read_ascii(SLAVE_ID, start, qty)
-                self._block_frames[(start, qty)] = (frame, b"")  # reset RX for this block
-                self._awaiting.append((start, qty))
-                self.worker.send(frame)
-        QtCore.QTimer.singleShot(delay_ms, _send_all)
-
-    def _confirm_run_state(self):
-        if self._pending_run is None:
-            return
-        if self._pending_attempts < 2:
-            value = RUN_VALUE if self._pending_run else STOP_VALUE
-            self.worker.send(build_write_single_register_ascii(SLAVE_ID, RUN_CMD_ADDR, value))
-            self._pending_attempts += 1
-            self._request_status_reads(220)
-            self._confirm_timer.start(350)
-        else:
-            self.chillerToggleBtn.setEnabled(True)
-            self._pending_run = None
-            self._pending_attempts = 0
-            self.on_status("Run/Stop did not confirm after retries.")
-
+    # ---- Write → read back status → retry flow ----
     def toggle_chiller(self, want_run: bool):
-        value = RUN_VALUE if want_run else STOP_VALUE
+        if not self.worker.is_open():
+            self.on_status("Open the port first")
+            self.chillerToggleBtn.blockSignals(True)
+            self.chillerToggleBtn.setChecked(not want_run)
+            self.chillerToggleBtn.blockSignals(False)
+            return
         self.chillerToggleBtn.setEnabled(False)
         self._pending_run = want_run
         self._pending_attempts = 0
-        self.worker.send(build_write_single_register_ascii(SLAVE_ID, RUN_CMD_ADDR, value))
-        self._request_status_reads(200)
-        self._confirm_timer.start(400)
+        self._send_run_command()
+
+    def _send_run_command(self):
+        self._pending_attempts += 1
+        value = RUN_VALUE if self._pending_run else STOP_VALUE
+        self.worker.send(write_request("run", self.model.run_cmd_addr, value))
+
+    def _request_confirm_poll(self):
+        if self._pending_run is None:
+            return
+        if self._cycle_outstanding:
+            self._confirm_queued = True  # that poll may predate the command; read again after it
+        else:
+            self.poll_once()
+            self._confirm_cycle = self._cycle
+
+    def _check_run_confirmation(self, snapshot: Dict[int, int]):
+        self._confirm_cycle = None
+        if self._pending_run is None:
+            return
+        status = snapshot.get(self.model.status_addr)
+        if status is not None and bool(status & 0x0001) == self._pending_run:
+            self.on_status("Chiller " + ("started" if self._pending_run else "stopped"))
+        elif self._pending_attempts <= RUN_CONFIRM_RETRIES:
+            self._send_run_command()
+            return
+        else:
+            self.on_error("Run/Stop did not confirm after retries.")
+        self._pending_run = None
+        self._pending_attempts = 0
+        self.chillerToggleBtn.setEnabled(True)
 
     # --------- Setpoint write ----------
     def write_setpoint(self):
+        if not self.worker.is_open():
+            self.on_status("Open the port first"); return
         unit = self.setTempUnit.currentText()
-        val  = round(self.setTempSpin.value(), 1)
-        if unit == "°C":
-            if not (5.0 <= val <= 40.0):
-                QtWidgets.QMessageBox.warning(self, "Invalid setpoint",
-                    "°C setpoint must be between 5.0 and 40.0")
-                return
-            raw = int(round(val * 10.0))
-        else:
-            if not (41.0 <= val <= 104.0):
-                QtWidgets.QMessageBox.warning(self, "Invalid setpoint",
-                    "°F setpoint must be between 41.0 and 104.0")
-                return
-            raw = int(round(self.f_to_c(val) * 10.0))
-        self.worker.send(build_write_single_register_ascii(SLAVE_ID, SETPOINT_ADDR, raw))
-        self.on_status(f"Setpoint written: {val:.1f} {unit} (raw {raw:#06x})")
+        decimals = self.model.setpoint_decimals
+        val = round(self.setTempSpin.value(), decimals)
+        lo_c, hi_c = self.model.setpoint_range_c
+        lo, hi = (lo_c, hi_c) if unit == "°C" else (self.c_to_f(lo_c), self.c_to_f(hi_c))
+        if not (lo <= val <= hi):
+            QtWidgets.QMessageBox.warning(self, "Invalid setpoint",
+                f"{unit} setpoint must be between {lo:.{decimals}f} and {hi:.{decimals}f}")
+            return
+        val_c = val if unit == "°C" else self.f_to_c(val)
+        raw = to_raw(val_c, self.model.setpoint_counts_per_c)
+        self.worker.send(write_request("setpoint", self.model.setpoint_addr, raw,
+                                       note=f"Setpoint written: {val:.{decimals}f} {unit} (raw {raw:#06x})"))
 
     # --------- Polling ----------
     def on_poll_interval_changed(self, _):
         if self.pollTimer.isActive():
-            self.pollTimer.stop()
-            self.poll_once()
             self.pollTimer.start(self.pollMs.value())
 
     def poll_once(self):
-        self._awaiting.clear()
-        for start, qty in POLL_BLOCKS:
-            frame = build_read_ascii(SLAVE_ID, start, qty)
-            self._block_frames[(start, qty)] = (frame, b"")
-            self._awaiting.append((start, qty))
-            self.worker.send(frame)
+        if not self.worker.is_open() or self._cycle_outstanding:
+            return  # previous poll still running; skip rather than pile up requests
+        self._cycle += 1
+        self._cycle_snapshot = {}
+        self._cycle_outstanding = len(self.model.poll_blocks)
+        for start, qty in self.model.poll_blocks:
+            self.worker.send(read_request(start, qty, self._cycle))
 
-    # --------- CSV saving ----------
-    def toggle_saving(self, enable: bool):
-        if enable:
-            chosen = self.checked_fields()
-            if not chosen:
-                QtWidgets.QMessageBox.information(self, "Select fields",
-                    "Check at least one diagnostic field before starting to save.")
-                self.saveToggleBtn.blockSignals(True); self.saveToggleBtn.setChecked(False); self.saveToggleBtn.blockSignals(False)
+    # --------- Worker replies ----------
+    def on_reply(self, req: Request, data: bytes, rx_frame: bytes):
+        if req.kind == "poll":
+            if req.cycle != self._cycle:
                 return
-            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Start saving CSV", "diagnostics_log.csv", "CSV Files (*.csv)")
-            if not path:
-                self.saveToggleBtn.blockSignals(True); self.saveToggleBtn.setChecked(False); self.saveToggleBtn.blockSignals(False)
-                return
-            try:
-                self.csv_file = open(path, "w", newline="", encoding="utf-8")
-                self.csv_writer = csv.writer(self.csv_file)
-                self.save_fields = list(chosen)
-                header = ["Timestamp"] + self.save_fields
-                self.csv_writer.writerow(header)
-                self.csv_header_written = True
-                self.saving_active = True
-                self.saveToggleBtn.setText("Stop Saving")
-                self.on_status(f"Saving to {path} (columns: {', '.join(self.save_fields)})")
-            except Exception as e:
-                self.on_status(f"Failed to open file: {e}")
-                self.saveToggleBtn.blockSignals(True); self.saveToggleBtn.setChecked(False); self.saveToggleBtn.blockSignals(False)
-        else:
-            if self.csv_file:
-                try: self.csv_file.close()
-                except Exception: pass
-            self.csv_file = None; self.csv_writer = None
-            self.csv_header_written = False; self.saving_active = False
-            self.save_fields = []
-            self.saveToggleBtn.setText("Start Saving")
-            self.on_status("Saving stopped")
+            regs = parse_0x03_registers(data)
+            self._cycle_snapshot.update({req.addr + i: v for i, v in enumerate(regs)})
+            self._block_frames[(req.addr, req.qty)] = (req.frame, rx_frame)
+            self._poll_request_done()
+        elif req.kind == "run":
+            QtCore.QTimer.singleShot(STATUS_CONFIRM_DELAY_MS, self._request_confirm_poll)
+        elif req.kind == "setpoint":
+            self.on_status(req.note)
 
-    def write_csv_row(self, timestamp_str: str, snapshot: Dict[int, int]):
-        if not (self.saving_active and self.csv_writer and self.csv_header_written):
+    def on_request_failed(self, req: Request, reason: str):
+        if req.kind == "poll":
+            if req.cycle != self._cycle:
+                return
+            self.on_error(f"Read {req.addr:#06x} x{req.qty} failed: {reason}")
+            self._poll_request_done()
+        elif req.kind == "run":
+            self.on_error(f"Run/Stop write failed: {reason}")
+            QtCore.QTimer.singleShot(STATUS_CONFIRM_DELAY_MS, self._request_confirm_poll)
+        elif req.kind == "setpoint":
+            self.on_error(f"Setpoint write failed: {reason}")
+
+    def _poll_request_done(self):
+        self._cycle_outstanding -= 1
+        if self._cycle_outstanding > 0:
             return
-        row = [timestamp_str]
-        for name in self.save_fields:
-            spec = FIELD_MAP.get(name)
-            if not spec:
-                row.append(""); continue
+        snapshot, self._cycle_snapshot = self._cycle_snapshot, {}
+        if snapshot:
+            self.process_snapshot(snapshot)
+        if self._confirm_cycle == self._cycle:
+            self._check_run_confirmation(snapshot)
+        if self._confirm_queued:
+            self._confirm_queued = False
+            self._request_confirm_poll()
+
+    # --------- Snapshot processing ----------
+    def heat_transfer_w(self, snapshot: Dict[int, int]) -> Optional[float]:
+        ht = self.model.heat_transfer
+        if not ht or ht.outlet_addr not in snapshot or ht.return_addr not in snapshot:
+            return None
+        dT = ht.scale(snapshot[ht.return_addr]) - ht.scale(snapshot[ht.outlet_addr])
+        cp_cal, rho = FLUIDS[self.fluidTypeBox.currentText()]
+        mass_kg_s = self.flowSpin.value() * rho / 60.0      # L/min × kg/L → kg/s
+        cp_j_kg = cp_cal * J_PER_CAL * 1000.0                # cal/g°C → J/kg°C
+        return mass_kg_s * cp_j_kg * dT
+
+    def _frames_for_addr(self, addr: int) -> Tuple[str, str]:
+        for (start, qty), (tx, rx) in self._block_frames.items():
+            if start <= addr < start + qty:
+                return (tx.decode('ascii', errors='replace').strip(),
+                        rx.decode('ascii', errors='replace').strip())
+        return "", ""
+
+    def process_snapshot(self, snapshot: Dict[int, int]):
+        m = self.model
+        if m.status_addr in snapshot:
+            self.set_run_indicator(bool(snapshot[m.status_addr] & 0x0001))
+        if m.setpoint_addr in snapshot:
+            self._last_setpoint_c = snapshot[m.setpoint_addr] / m.setpoint_counts_per_c
+            self._update_setpoint_label()
+
+        values: Dict[str, float] = {}
+        for name, spec in m.fields.items():
             if spec.addr in snapshot:
-                try:
-                    val = spec.scale([snapshot[spec.addr]])
-                    row.append(f"{val:.3f}")
-                except Exception:
-                    row.append("")
-            else:
-                row.append("")
-        self.csv_writer.writerow(row)
-
-    # --------- Incoming frames ----------
-    def on_frame(self, addr: int, func: int, data: bytes):
-        if func == 0x06:
-            self.on_status("Write ACK received")
-            return
-        if func != 0x03:
-            return
-
-        block = self._awaiting.popleft() if self._awaiting else None
-        if block:
-            start, qty = block
-            rx_full = build_response_ascii(addr, func, data)
-            tx = self._block_frames.get(block, (b"", b""))[0]
-            self._block_frames[block] = (tx, rx_full)
-
-        regs = parse_0x03_registers(data)
-        if not regs:
-            return
-
-        base_addr = block[0] if block else POLL_BLOCKS[0][0]
-        snapshot_part = {base_addr + i: v for i, v in enumerate(regs)}
-
-        if not hasattr(self, "_tick_snapshot"):
-            self._tick_snapshot = {}
-        self._tick_snapshot.update(snapshot_part)
-
-        if self._awaiting:
-            return  # wait for remaining block(s)
-
-        snapshot = getattr(self, "_tick_snapshot", {})
-        self._tick_snapshot = {}
-
-        if STATUS_ADDR in snapshot:
-            self.set_run_indicator(bool(snapshot[STATUS_ADDR] & 0x0001))
+                values[name] = spec.scale(snapshot[spec.addr])
+        heat = self.heat_transfer_w(snapshot)
+        if heat is not None:
+            values[HEAT_TRANSFER_FIELD] = heat
 
         now = time.time() - self.t0
         ts_str = time.strftime("%H:%M:%S")
 
-        if SETPOINT_ADDR in snapshot:
-            try:
-                sp_c = scale_temp10_unsigned([snapshot[SETPOINT_ADDR]])
-                self.setTempReadLbl.setText(f"Last read: {sp_c:.1f} °C")
-            except Exception:
-                pass
-
-        if self._pending_run is not None and STATUS_ADDR in snapshot:
-            current_running = bool(snapshot[STATUS_ADDR] & 0x0001)
-            if current_running == self._pending_run:
-                if self._confirm_timer.isActive():
-                    self._confirm_timer.stop()
-                self.chillerToggleBtn.setEnabled(True)
-                self._pending_run = None
-                self._pending_attempts = 0
-
-        # --- Derived Heat Transfer (W) ---
-        if 0x5201 in snapshot and 0x0000 in snapshot:
-            T_return = snapshot[0x5201] / 10.0
-            T_dis    = snapshot[0x0000] / 10.0
-            dT = T_return - T_dis
-
-            flow_L_min = self.flowSpin.value()
-            if self.fluidTypeBox.currentText() == "Water":
-                cp = 1.002   # cal/g°C
-                rho = 1.0    # g/cm³
-            else:
-                cp = 0.23
-                rho = 1.0
-
-            try:
-                heat_watts = ((dT) * flow_L_min * rho * 1000.0 * (cp * 1000.0 / 0.239)) / (60.0 * 1000.0)
-            except Exception:
-                heat_watts = 0.0
-
-            snapshot[-1] = heat_watts
-
         # -------- Maintain history --------
-        for name, spec in FIELD_MAP.items():
-            if spec.addr not in snapshot:
-                continue
-            try:
-                val = spec.scale([snapshot[spec.addr]])
-            except Exception:
-                continue
+        for name, val in values.items():
             xs, ys = self.history.setdefault(name, ([], []))
             xs.append(now); ys.append(val)
-            if len(xs) > 1000:
-                del xs[:len(xs)-1000]; del ys[:len(ys)-1000]
+            if len(xs) > MAX_HISTORY_POINTS:
+                del xs[:len(xs)-MAX_HISTORY_POINTS]; del ys[:len(ys)-MAX_HISTORY_POINTS]
 
         # -------- Log checked fields (with TX/RX) --------
-        checked = self.checked_fields()
-        for name in checked:
-            spec = FIELD_MAP[name]
-            if spec.addr not in snapshot:
+        for name in self.checked_fields():
+            if name not in values:
                 continue
-            try:
-                val = spec.scale([snapshot[spec.addr]])
-            except Exception:
-                continue
-
-            blk_for_row = None
-            if spec.addr == -1:
-                blk_for_row = (0x5200, 0x0002)
-            else:
-                for b in POLL_BLOCKS:
-                    s, q = b
-                    if s <= spec.addr < s + q:
-                        blk_for_row = b
-                        break
-
-            tx_str = rx_str = ""
-            if blk_for_row and blk_for_row in self._block_frames:
-                tx, rx = self._block_frames[blk_for_row]
-                tx_str = tx.decode('ascii', errors='replace').strip()
-                rx_str = rx.decode('ascii', errors='replace').strip()
-
+            frame_addr = m.heat_transfer.return_addr if name == HEAT_TRANSFER_FIELD else m.fields[name].addr
+            tx_str, rx_str = self._frames_for_addr(frame_addr)
             row = self.table.rowCount(); self.table.insertRow(row)
             self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(ts_str))
             self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(name))
-            self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{val:.3f}"))
+            self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{values[name]:.3f}"))
             tx_item = QtWidgets.QTableWidgetItem(tx_str); tx_item.setToolTip("Poll request (Modbus ASCII)")
             rx_item = QtWidgets.QTableWidgetItem(rx_str); rx_item.setToolTip("Poll response (Modbus ASCII)")
             self.table.setItem(row, 3, tx_item); self.table.setItem(row, 4, rx_item)
-            self.table.scrollToBottom()
+        excess = self.table.rowCount() - MAX_TABLE_ROWS
+        for _ in range(max(0, excess)):
+            self.table.removeRow(0)
+        self.table.scrollToBottom()
 
-        # -------- Plot: left vs right axes --------
-        # Remove curves unchecked (also clean legend by name)
-        for name in list(self.left_curves.keys()):
-            if name not in checked:
-                self.plot.removeItem(self.left_curves[name])
-                self.legend.removeItem(name)  # remove the auto-added legend row
-                del self.left_curves[name]
-        for name in list(self.right_curves.keys()):
-            if name not in checked:
-                self.vb_right.removeItem(self.right_curves[name])
-                if name in self.right_in_legend:
-                    self.legend.removeItem(name)
-                    self.right_in_legend.discard(name)
-                del self.right_curves[name]
+        self.update_plot()
+        self.write_csv_row(ts_str, values)
 
-        # Ensure Heat Transfer goes to right axis; others on left
-        for name in checked:
+    # --------- Plot ----------
+    def _pen_for(self, name: str) -> pg.mkPen:
+        if name in self._pen_cache:
+            return self._pen_cache[name]
+        if self._palette_i < len(PALETTE_HEX):
+            color = PALETTE_HEX[self._palette_i]
+        else:
+            color = pg.intColor((self._palette_i * 7) % 36, hues=36)
+        self._palette_i += 1
+        pen = pg.mkPen(color, width=2.5, cosmetic=True)
+        self._pen_cache[name] = pen
+        return pen
+
+    def update_plot(self):
+        checked = set(self.checked_fields())
+        changed = False
+
+        # Remove unchecked curves
+        for curves, owner in ((self.left_curves, self.plot), (self.right_curves, self.vb_right)):
+            for name in list(curves):
+                if name not in checked:
+                    owner.removeItem(curves.pop(name))
+                    changed = True
+
+        # Heat Transfer goes to the right axis; everything else on the left
+        for name in self.field_names():
+            if name not in checked:
+                continue
             xs, ys = self.history.get(name, ([], []))
-            if name == "Heat Transfer (W)":
-                if name not in self.right_curves:
-                    c = pg.PlotDataItem(xs, ys, name=name, pen=self._pen_for(name))
-                    self.vb_right.addItem(c)
-                    self.right_curves[name] = c
-                    if name not in self.right_in_legend:
-                        self.legend.addItem(c, name)  # manual add for right axis only
-                        self.right_in_legend.add(name)
-                else:
-                    self.right_curves[name].setData(xs, ys)
-            else:
-                if name not in self.left_curves:
-                    c = self.plot.plot(xs, ys, name=name, pen=self._pen_for(name))  # auto legend add
-                    self.left_curves[name] = c
-                else:
-                    self.left_curves[name].setData(xs, ys)
+            curves = self.right_curves if name == HEAT_TRANSFER_FIELD else self.left_curves
+            if name in curves:
+                curves[name].setData(xs, ys)
+                continue
+            c = pg.PlotDataItem(xs, ys, pen=self._pen_for(name))
+            (self.vb_right if curves is self.right_curves else self.plot).addItem(c)
+            curves[name] = c
+            changed = True
+
+        if changed:
+            self.legend.clear()
+            for name in self.field_names():
+                c = self.left_curves.get(name) or self.right_curves.get(name)
+                if c is not None:
+                    self.legend.addItem(c, name)
 
         # ---- Unified X autorange ----
         xmins, xmaxs = [], []
@@ -972,8 +1063,56 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.enableAutoRange('y', True)
         self.vb_right.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
 
-        # Saving
-        self.write_csv_row(ts_str, snapshot)
+    # --------- CSV saving ----------
+    def _reset_save_button(self):
+        self.saveToggleBtn.blockSignals(True); self.saveToggleBtn.setChecked(False); self.saveToggleBtn.blockSignals(False)
+
+    def toggle_saving(self, enable: bool):
+        if enable:
+            chosen = self.checked_fields()
+            if not chosen:
+                QtWidgets.QMessageBox.information(self, "Select fields",
+                    "Check at least one diagnostic field before starting to save.")
+                self._reset_save_button()
+                return
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Start saving CSV", "diagnostics_log.csv", "CSV Files (*.csv)")
+            if not path:
+                self._reset_save_button()
+                return
+            try:
+                self.csv_file = open(path, "w", newline="", encoding="utf-8")
+                self.csv_writer = csv.writer(self.csv_file)
+                self.save_fields = list(chosen)
+                self.csv_writer.writerow(["Timestamp"] + self.save_fields)
+                self.csv_file.flush()
+                self.saving_active = True
+                self.saveToggleBtn.setText("Stop Saving")
+                self.on_status(f"Saving to {path} (columns: {', '.join(self.save_fields)})")
+            except Exception as e:
+                self.on_error(f"Failed to open file: {e}")
+                self._reset_save_button()
+        else:
+            if self.csv_file:
+                try: self.csv_file.close()
+                except Exception: pass
+            self.csv_file = None; self.csv_writer = None
+            self.saving_active = False
+            self.save_fields = []
+            self.saveToggleBtn.setText("Start Saving")
+            self.on_status("Saving stopped")
+
+    def write_csv_row(self, timestamp_str: str, values: Dict[str, float]):
+        if not (self.saving_active and self.csv_writer):
+            return
+        row = [timestamp_str]
+        for name in self.save_fields:
+            row.append(f"{values[name]:.3f}" if name in values else "")
+        try:
+            self.csv_writer.writerow(row)
+            self.csv_file.flush()  # keep the log intact if the app or PC goes down
+        except Exception as e:
+            self.on_error(f"CSV write failed: {e}")
+            self.saveToggleBtn.setChecked(False)
 
     # --------- Field list helpers ----------
     def checked_fields(self) -> List[str]:
@@ -984,9 +1123,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 names.append(it.text())
         return names
 
-    def on_field_check(self, item: QtWidgets.QListWidgetItem):
-        # legend handled when curves are added/removed
-        pass
+    def on_field_check(self, _item: QtWidgets.QListWidgetItem):
+        self.update_plot()
 
 def main():
     app = QtWidgets.QApplication(sys.argv)

@@ -1,44 +1,62 @@
-#Chiller Diagnostics GUI
+# Chiller Diagnostics GUI
 
-A standalone desktop application for communicating with **industrial chillers** via **Modbus ASCII** over serial connection.  
-The app allows users to monitor, log, and control diagnostic parameters such as temperature, pressure, conductivity, alarms, and setpoints in real time.
+A standalone desktop application for communicating with **SMC industrial chillers** via **Modbus ASCII** over a serial connection.
+The app lets you monitor, log, and control diagnostic parameters such as temperature, pressure, conductivity, run state, and setpoint in real time.
 
 ---
 
 ## Features
 
-- **Real-time polling** of diagnostic registers  
-- **Dynamic graphs** with multiple selectable data fields  
-- **Live system status indicator** (RUN / STOP bit)  
-- **Setpoint control** with °C/°F write-back and validation  
-- **Data logging** (on-screen table + CSV export)  
-- **Continuous polling** when the serial port is open  
-- **Demo Mode** for testing without hardware (simulated data)  
-- **Modern PyQt5 interface** with dark theme and responsive layout  
+- **Multiple chiller models** — pick the register map from the *Model* drop-down
+- **Real-time polling** of diagnostic registers, one request/response at a time with timeouts
+- **Dynamic graphs** with multiple selectable data fields (Heat Transfer on its own right-hand axis)
+- **Live system status indicator** (RUN / STOP bit) with confirmed, retried Run/Stop commands
+- **Setpoint control** with °C/°F write-back and per-model range validation
+- **Heat transfer calculation** (W) from flow rate, fluid type, and supply/return temperatures
+- **Data logging** — on-screen table with raw TX/RX frames, plus CSV export (flushed every row)
+- **Demo mode** for testing without hardware (`--demo`)
+- **PyQt5 interface** with dark theme
 
 ---
 
-## How It Works
+## Supported models
 
-The application communicates with a chiller using the **Modbus ASCII** protocol (7E1, 9600/19200 bps).  
-When connected to a serial port:
+| Model | Registers polled | Run cmd | Status (bit0) | Setpoint | Units |
+|---|---|---|---|---|---|
+| Standard | `0x0000–0x000B`, `0x5200–0x5201` | `0x000C` | `0x0004` | `0x000B` (5–40 °C) | 0.1 °C |
+| HEC | `0x0040–0x0051` | `0x0050` | `0x0043` | `0x0051` (10–60 °C) | 0.01 °C |
 
-1. The app continuously polls registers `0x0000` – `0x000B` for diagnostic data.  
-2. Each selected diagnostic field appears in the live graph and data log.  
-3. The **RUN/STOP bit** at register `0x0004` updates the status indicator automatically.  
-4. The **Fluid Set Temp** register (`0x000B`) can be read and written directly.  
-5. Data can be saved to CSV in wide format (each field as a column).  
+To add a model, append a `ChillerModel` entry to `MODELS` in `ChillerDiagGui.py`.
+
+---
+
+## Running from source
+
+Requires **Python 3.8** (the last version supporting Windows 7).
+
+```
+py -3.8 -m venv .venv38
+.venv38\Scripts\pip install -r requirements.txt
+.venv38\Scripts\python ChillerDiagGui.py          # real serial port
+.venv38\Scripts\python ChillerDiagGui.py --demo   # simulated chiller
+```
+
+Default serial framing is 7E1 at 9600 baud; all settings can be changed in the UI before opening the port.
+
+## Building the executable
+
+```
+.venv38\Scripts\pyinstaller ChillerDiagGui.spec
+```
+
+The app is written to `dist\ChillerDiagGui\` (`ChillerDiagGui.exe` plus a `deps` folder). Publish builds as GitHub Releases rather than committing them.
 
 ---
 
 ## Technologies Used
 
-- **Python 3.8+** (Windows 7 compatible)
-- **PyQt5** — GUI framework  
-- **pyqtgraph** — real-time plotting  
-- **pyserial** — serial communication  
-- **dataclasses / typing** — structured field mapping  
-- **CSV I/O** — data export  
-
----
-
+- **Python 3.8** (Windows 7 compatible)
+- **PyQt5** — GUI framework
+- **pyqtgraph** — real-time plotting
+- **pyserial** — serial communication
+- **PyInstaller** — packaging
