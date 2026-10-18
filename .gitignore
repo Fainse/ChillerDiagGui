@@ -1,0 +1,16 @@
+# Virtual environments
+.venv*/
+venv*/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# PyInstaller output (publish built executables as GitHub Releases instead)
+build/
+dist/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
