@@ -43,15 +43,22 @@ py -3.8 -m venv .venv38
 
 Default serial framing is 7E1 at 9600 baud; all settings can be changed in the UI before opening the port.
 
-## Building the executable
+## Installing (end users)
 
-```
-.venv38\Scripts\pyinstaller ChillerDiagGui.spec
-```
+Download `ChillerDiagGui-Setup-<version>.exe` from the GitHub Releases page, run it, and click through the wizard. No admin rights or other software are needed; it installs for the current user and adds a Start Menu entry (and optionally a desktop shortcut). Uninstall from *Settings → Apps*. Running a newer setup upgrades the existing install.
 
-The app is written to `dist\ChillerDiagGui\` (`ChillerDiagGui.exe` plus a `deps` folder). Ship the whole folder, and publish builds as GitHub Releases rather than committing them.
+Requirements: Windows 7 SP1 or later (Windows 7/8.1 also need update KB2999226 — the Universal C Runtime), plus the driver for your USB-serial adapter.
 
-File details shown in the exe's *Properties → Details* come from `version_info.txt`; bump the version numbers there for each release.
+IT can install for all users with `ChillerDiagGui-Setup-<version>.exe /ALLUSERS`, or silently with `/VERYSILENT`.
+
+## Building a release
+
+Requires the `.venv38` environment above and [Inno Setup 6](https://jrsoftware.org/isdl.php).
+
+1. Bump the version in `version_info.txt` (both `filevers`/`prodvers` and the `FileVersion`/`ProductVersion` strings).
+2. Run `build.bat`.
+
+This builds the app into `dist\ChillerDiagGui\` with PyInstaller, then packages it as `dist\ChillerDiagGui-Setup-<version>.exe` using `installer\ChillerDiagGui.iss`. Upload the setup exe to a GitHub Release; don't commit build output.
 
 ### Antivirus / SmartScreen warnings
 
